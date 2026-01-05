@@ -1,0 +1,10 @@
+[package]
+name = "gcpool"
+version = "0.1.0"
+edition = "2024"
+
+authors = ["ogghostjelly"]
+license = "WTFPL"
+description = "A Deeply Unsafe Garbage Collection Pool using Tri-Color Mark & Sweep in Rust"
+
+[dependencies]
