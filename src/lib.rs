@@ -1,3 +1,4 @@
+#![feature(ptr_metadata, ptr_as_ref_unchecked)]
 #![doc = include_str!("../README.md")]
 
 use std::{
@@ -15,8 +16,8 @@ use std::{
 
 #[derive(Default)]
 pub struct GcPool {
-    all: RwLock<Vec<NonNull<GcInner<()>>>>,
-    grey: RwLock<Vec<NonNull<GcInner<()>>>>,
+    all: RwLock<Vec<NonNull<GcInner<dyn Trace>>>>,
+    grey: RwLock<Vec<NonNull<GcInner<dyn Trace>>>>,
 }
 
 impl GcPool {
@@ -112,7 +113,7 @@ impl GcPool {
 
             for ptr in mem::replace(grey.as_mut(), src) {
                 let value = unsafe { ptr.as_ref() };
-                unsafe { value.vtable.grey_children(&value.value, &mut grey) };
+                value.value.append_children(&mut grey);
             }
         }
     }
@@ -122,15 +123,11 @@ impl GcPool {
         // which means that it won't delete things while we're setting up a new allocation.
         let mut all = self.all.write().unwrap();
 
-        let ptr = Box::leak(Box::new(GcInner {
-            color: Cell::new(Color::White),
-            vtable: GcVtable::new::<T>(),
-            value,
-        }));
+        let ptr = Box::leak(GcInner::new(Cell::new(Color::White), value));
 
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
 
-        all.push(ptr.cast());
+        all.push(ptr);
 
         Gc {
             ptr,
@@ -154,10 +151,11 @@ impl Drop for GcPool {
     }
 }
 
-unsafe fn drop_ptr(ptr: NonNull<GcInner<()>>) {
+unsafe fn drop_ptr(ptr: NonNull<GcInner<dyn Trace>>) {
     unsafe {
+        let layout = ptr.as_ref().layout;
         ptr.drop_in_place();
-        dealloc(ptr.as_ptr() as *mut u8, Layout::new::<GcInner<()>>());
+        dealloc(ptr.as_ptr() as *mut u8, layout);
     };
 }
 
@@ -196,8 +194,8 @@ impl Drop for ThreadedGcPool {
     }
 }
 
-pub struct Gc<T: ?Sized> {
-    ptr: NonNull<GcInner<T>>,
+pub struct Gc<T> {
+    ptr: NonNull<GcInner<dyn Trace>>,
     phantom: PhantomData<T>,
 }
 
@@ -206,7 +204,7 @@ impl<T> Gc<T> {
         let grey = &mut *pool.grey.write().unwrap();
         let value = unsafe { self.ptr.as_ref() };
         value.color.set(Color::Root);
-        grey.push(self.ptr.cast());
+        grey.push(self.ptr);
         self
     }
 
@@ -240,13 +238,13 @@ impl<T> Deref for Gc<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &unsafe { self.ptr.as_ref() }.value
+        unsafe { (&raw const self.ptr.as_ref().value as *const T).as_ref_unchecked() }
     }
 }
 
 impl<T> DerefMut for Gc<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut unsafe { self.ptr.as_mut() }.value
+        unsafe { (&raw mut self.ptr.as_mut().value as *mut T).as_mut_unchecked() }
     }
 }
 
@@ -262,48 +260,20 @@ impl<T> AsMut<T> for Gc<T> {
     }
 }
 
-// NOTE: #[repr(C)] is required so that `sizeof GcInner<()> == sizeof GcInner<T>`
-//       the gc needs to be able to erase the type so you can allocate any type of object in it.
 #[repr(C)]
 pub struct GcInner<T: ?Sized> {
     color: Cell<Color>,
-    vtable: GcVtable,
+    layout: Layout,
     value: T,
 }
 
-impl<T: ?Sized> Drop for GcInner<T> {
-    fn drop(&mut self) {
-        let ptr = &mut self.value as *mut T as *mut ();
-        let ptr = unsafe { ptr.as_mut().unwrap() };
-        (self.vtable.drop_ptr)(ptr);
-    }
-}
-
-struct GcVtable {
-    grey_children_ptr: fn(&(), &mut Vec<NonNull<GcInner<()>>>),
-    drop_ptr: fn(&mut ()),
-}
-
-impl GcVtable {
-    pub fn new<T: Trace>() -> GcVtable {
-        type GreyFrom<T> = unsafe fn(&T, &mut Vec<NonNull<GcInner<()>>>);
-        type GreyTo = fn(&(), &mut Vec<NonNull<GcInner<()>>>);
-        let ptr = T::append_children as GreyFrom<T>;
-        let grey_children_ptr = unsafe { mem::transmute::<GreyFrom<T>, GreyTo>(ptr) };
-
-        type DropFrom<T> = unsafe fn(&mut ManuallyDrop<T>);
-        type DropTo = fn(&mut ());
-        let ptr = ManuallyDrop::<T>::drop as DropFrom<T>;
-        let drop_ptr = unsafe { mem::transmute::<DropFrom<T>, DropTo>(ptr) };
-
-        GcVtable {
-            grey_children_ptr,
-            drop_ptr,
-        }
-    }
-
-    pub unsafe fn grey_children(&self, this: &(), grey: &mut Vec<NonNull<GcInner<()>>>) {
-        (self.grey_children_ptr)(this, grey);
+impl GcInner<dyn Trace> {
+    fn new<T: Trace + 'static>(color: Cell<Color>, value: T) -> Box<Self> {
+        Box::new(GcInner {
+            color,
+            layout: Layout::new::<GcInner<T>>(),
+            value,
+        })
     }
 }
 
@@ -321,22 +291,22 @@ enum Color {
 /// Then the pointer may be garbage-collected and left dangling.
 pub unsafe trait Trace {
     /// Append pointers that this data-structure references to the list.
-    fn append_children(&self, children: &mut Vec<NonNull<GcInner<()>>>);
+    fn append_children(&self, children: &mut Vec<NonNull<GcInner<dyn Trace>>>);
 }
 
 unsafe impl<T: Trace> Trace for Gc<T> {
-    fn append_children(&self, grey: &mut Vec<NonNull<GcInner<()>>>) {
+    fn append_children(&self, grey: &mut Vec<NonNull<GcInner<dyn Trace>>>) {
         let value = unsafe { self.ptr.as_ref() };
         if matches!(value.color.get(), Color::White) {
             value.color.set(Color::Black);
-            grey.push(self.ptr.cast());
+            grey.push(self.ptr);
             unsafe { self.ptr.as_ref() }.value.append_children(grey);
         }
     }
 }
 
 unsafe impl<T: Trace> Trace for Vec<T> {
-    fn append_children(&self, children: &mut Vec<NonNull<GcInner<()>>>) {
+    fn append_children(&self, children: &mut Vec<NonNull<GcInner<dyn Trace>>>) {
         for value in self {
             value.append_children(children);
         }
@@ -344,7 +314,7 @@ unsafe impl<T: Trace> Trace for Vec<T> {
 }
 
 unsafe impl<T: Trace> Trace for [T] {
-    fn append_children(&self, children: &mut Vec<NonNull<GcInner<()>>>) {
+    fn append_children(&self, children: &mut Vec<NonNull<GcInner<dyn Trace>>>) {
         for value in self {
             value.append_children(children);
         }
@@ -352,7 +322,7 @@ unsafe impl<T: Trace> Trace for [T] {
 }
 
 unsafe impl<K: Trace, V: Trace, S> Trace for HashMap<K, V, S> {
-    fn append_children(&self, children: &mut Vec<NonNull<GcInner<()>>>) {
+    fn append_children(&self, children: &mut Vec<NonNull<GcInner<dyn Trace>>>) {
         for (k, v) in self {
             k.append_children(children);
             v.append_children(children);
@@ -361,7 +331,7 @@ unsafe impl<K: Trace, V: Trace, S> Trace for HashMap<K, V, S> {
 }
 
 unsafe impl<T: Trace> Trace for Option<T> {
-    fn append_children(&self, children: &mut Vec<NonNull<GcInner<()>>>) {
+    fn append_children(&self, children: &mut Vec<NonNull<GcInner<dyn Trace>>>) {
         if let Some(value) = self {
             value.append_children(children);
         }
@@ -369,7 +339,7 @@ unsafe impl<T: Trace> Trace for Option<T> {
 }
 
 unsafe impl<T: Trace, E: Trace> Trace for Result<T, E> {
-    fn append_children(&self, children: &mut Vec<NonNull<GcInner<()>>>) {
+    fn append_children(&self, children: &mut Vec<NonNull<GcInner<dyn Trace>>>) {
         match self {
             Ok(value) => value.append_children(children),
             Err(error) => error.append_children(children),
@@ -378,13 +348,13 @@ unsafe impl<T: Trace, E: Trace> Trace for Result<T, E> {
 }
 
 unsafe impl<T: Trace> Trace for &T {
-    fn append_children(&self, children: &mut Vec<NonNull<GcInner<()>>>) {
+    fn append_children(&self, children: &mut Vec<NonNull<GcInner<dyn Trace>>>) {
         (**self).append_children(children);
     }
 }
 
 unsafe impl<T: Trace> Trace for &mut T {
-    fn append_children(&self, children: &mut Vec<NonNull<GcInner<()>>>) {
+    fn append_children(&self, children: &mut Vec<NonNull<GcInner<dyn Trace>>>) {
         (**self).append_children(children);
     }
 }
@@ -392,7 +362,7 @@ unsafe impl<T: Trace> Trace for &mut T {
 macro_rules! impl_trace_for_atom {
     ( $t:ty ) => {
         unsafe impl Trace for $t {
-            fn append_children(&self, _: &mut Vec<NonNull<GcInner<()>>>) {}
+            fn append_children(&self, _: &mut Vec<NonNull<GcInner<dyn Trace>>>) {}
         }
     };
 }
@@ -423,7 +393,7 @@ mod test {
 
         struct MyStruct(Option<Gc<MyStruct>>);
         unsafe impl Trace for MyStruct {
-            fn append_children(&self, children: &mut Vec<NonNull<GcInner<()>>>) {
+            fn append_children(&self, children: &mut Vec<NonNull<GcInner<dyn Trace>>>) {
                 self.0.append_children(children);
             }
         }

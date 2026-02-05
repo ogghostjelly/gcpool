@@ -106,7 +106,7 @@ struct MyStruct {
 }
 
 unsafe impl Trace for MyStruct {
-    fn append_children(&self, children: &mut Vec<NonNull<GcInner<()>>>) {
+    fn append_children(&self, children: &mut Vec<NonNull<GcInner<dyn Trace>>>) {
         self.a.append_children(children); // Please don't delete a we need it!
         self.b.append_children(children); // Please don't delete b we need it!
         self.c.append_children(children); // Please don't delete c we need it!
