@@ -4,6 +4,8 @@ Yes, valgrind says its OK. Yes, the tests pass. No, you will not enjoy fixing th
 
 No dependencies and approximately 500 lines of code.
 
+By the way, `cargo valgrind test` will report a 48 B memory leak. This isn't the libraries fault. The leak is somewhere in either Rust stdlib or cargo valgrind itself. I know this because it still leaks when running an empty test with no function body. If you want to test for leaks you'll have to copy/paste the test into `fn main` and `cargo valgrind run`.
+
 # Examples
 
 ## Allocating Objects
